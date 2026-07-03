@@ -1,324 +1,316 @@
+import torch
+import os
 import numpy as np
-from config import config, init_historical_data
-from surrogate_models import SurrogateModel
+from simulator import Manufacturing_Simulator
+from agent import PPOAgent, OptimalFollowerValueEstimator
+from config import config, LEADER, BUYER, TRANSFORM, stages
+from torch.utils.tensorboard import SummaryWriter
+from logging import getLogger
+from utils import AverageMeter, get_result_folder
 
-class Manufacturing_Simulator:
+class RunningMeanStd:
     """
-    Bilevel Environment Class with Temporal Price Inertia
+    Dynamically normalizes observations into [ -1.0, 1.0 ]
     """
+    def __init__(self, shape):
+        self.mean = np.zeros(shape, dtype=np.float32)
+        self.var = np.ones(shape, dtype=np.float32)
+        self.count = 1e-4
+
+    def update(self, x):
+        batch_mean = np.mean(x, axis=0)
+        batch_var = np.var(x, axis=0)
+        batch_count = x.shape[0] if x.ndim > 1 else 1
+        
+        if x.ndim == 1:
+            x = np.expand_dims(x, axis=0)
+            batch_mean = x[0]
+            batch_var = np.zeros_like(batch_mean)
+            batch_count = 1
+            
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+
+        new_mean = self.mean + delta * batch_count / tot_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + np.square(delta) * self.count * batch_count / tot_count
+        new_var = M2 / tot_count
+
+        self.mean = new_mean
+        self.var = new_var
+        self.count = tot_count
+        
+    def normalize(self, x):
+        return (x - self.mean) / np.sqrt(self.var + 1e-8)
+
+class BilevelTrainer:
     def __init__(self):
         for key, value in config.items():
             setattr(self, key, value)
-        self.surrogate_model = SurrogateModel()
+
+        self.env = Manufacturing_Simulator()
         
-    def reset(self):
-        self.t = self.history_length
-        self.active_phi = None  # Reset the price smoothing filter for the episode
+        self.result_folder = './result/bilevel_ppo'
+        self.debug_folder = self.result_folder + '/debug'
+        log_folder = self.result_folder + '/log'
         
-        data_length = self.history_length + self.episode_length + 1
-        general_shape = (self.num_commodities, data_length)
-        individual_shape = (self.num_agents, self.num_commodities, data_length)
-        pair_shape = (self.num_agents, self.num_agents, self.num_commodities, data_length)
+        os.makedirs(log_folder, exist_ok=True)
+        os.makedirs(self.debug_folder, exist_ok=True)
+        self.writer = SummaryWriter(log_folder)
 
-        self.spot_price = np.zeros(shape=general_shape)
-        self.uc_p = np.zeros(shape=general_shape)
-        self.tx_p = np.zeros(shape=general_shape)
-
-        self.price = np.zeros(shape=individual_shape)
-        self.waste_price = np.zeros(shape=individual_shape)
-
-        self.q = np.zeros(shape=pair_shape)
-        self.waste_q = np.zeros(shape=pair_shape)
-        self.spot_q = np.zeros(shape=individual_shape)
-
-        self.actual_d = np.zeros(shape=pair_shape)
-        self.waste_actual_d = np.zeros(shape=pair_shape)
-
-        self.inv = np.zeros(shape=individual_shape) 
-        self.waste_inv = np.zeros(shape=individual_shape) 
-        self.inv_buy = np.zeros(shape=individual_shape) 
-        self.waste_inv_buy = np.zeros(shape=individual_shape) 
-
-        self.eco_u = np.zeros(shape=individual_shape)
-        self.tx_u = np.zeros(shape=individual_shape)
-        self.wastewater = np.zeros(shape=(1, 1, data_length))
-
-        historical_data = init_historical_data()
-        self.spot_price = np.repeat(historical_data['spot_price'], repeats=data_length, axis=1)
-        self.uc_p = self.UC * self.spot_price
-        self.tx_p = self.TX_P * self.spot_price
-        self.inv[:, :, self.t] = self.inv[:, :, self.t] + self.INIT_INV
-        self.waste_inv = self.inv.copy()
-        self.init_inv = self.inv[:, :, self.t].copy()
-
-        return self.get_leader_state(), self.get_follower_state()
-    
-    def get_leader_state(self):
-        """
-        Upper-level state reflecting macro-environmental performance (14 dimensions)
-        """
-        avg_spot = np.mean(self.spot_price[:, self.t-self.history_length:self.t], axis=1)
-        total_waste_landfilled = np.sum(self.spot_q[:, :, self.t-1]) if self.t > self.history_length else 0.
-        total_freshwater = np.sum(self.inv[:, 0, self.t])
-        return np.concatenate((avg_spot, [total_waste_landfilled, total_freshwater]))
-
-    def get_follower_state(self):
-        """
-        Decentralized follower state tracking localized dynamics (1824 dimensions)
-        """
-        follower_states = []
-        start_time = self.t - self.history_length
-        for n in range(self.num_agents):
-            p = self.spot_price[..., start_time:self.t].flatten()
-            e = self.price[..., start_time:self.t].flatten()
-            ew = self.waste_price[..., start_time:self.t].flatten()
-
-            q = self.q[:, n, :, start_time:self.t].flatten()
-            qw = self.waste_q[:, n, :, start_time:self.t].flatten()
-
-            q_ = self.q[n, :, :, start_time:self.t].flatten()
-            qw_ = self.waste_q[n, :, :, start_time:self.t].flatten()
-
-            qs = self.spot_q[n, :, start_time:self.t].flatten()
-
-            d = self.actual_d[n, :, :, start_time:self.t].flatten()
-            dw = self.waste_actual_d[n, :, :, start_time:self.t].flatten()
-
-            I = self.inv[n, :, start_time:self.t+1].flatten()
-            Iw = self.waste_inv[n, :, start_time:self.t+1].flatten()
-
-            u_eco = self.eco_u[n,:,start_time:self.t].flatten()
-            u_tx = self.tx_u[n,:,start_time:self.t].flatten()   
-
-            state_flat = np.concatenate((p, e, ew, q, qw, q_, qw_, qs, d, dw, I, Iw, u_eco, u_tx))
-            follower_states.append(state_flat)
-
-        return np.array(follower_states)
-
-    def action_conversion(self, keys, actions):
-        conv_actions = {k: np.zeros((self.num_agents, length), dtype=actions.dtype) for k, length in keys.items()}
-        for i in range(self.num_agents):
-            start = 0
-            for key, length in keys.items():
-                conv_actions[key][i] = actions[i, start:start + length]
-                start += length
-        return conv_actions
-
-    def get_buyer_state(self, s_follower):
-        """
-        Constructs the 1908-dimension state vector for step 2 buyers
-        """
-        buyer_states = []
-        for n in range(self.num_agents):
-            state_flat = s_follower[n]
-            state_flat = np.concatenate((
-                state_flat, 
-                self.spot_price[:, self.t], 
-                self.price[:, :, self.t].flatten(), 
-                self.waste_price[:, :, self.t].flatten()
-            ))
-            buyer_states.append(state_flat)
-        return np.array(buyer_states)
-
-    def get_trans_state(self, s_buyer):
-        """
-        Constructs the 2088-dimension state vector for step 3 transformers
-        """
-        trans_states = []
-        for n in range(self.num_agents):
-            state_flat = s_buyer[n]
-            
-            q_flat = self.q[n, :, :, self.t].flatten()               
-            waste_q_flat = self.waste_q[n, :, :, self.t].flatten()   
-            spot_q_flat = self.spot_q[n, :, self.t].flatten()     
-            state_flat = np.concatenate([state_flat, q_flat, waste_q_flat, spot_q_flat])
-            
-            actual_d_flat = self.actual_d[n, :, :, self.t].flatten()             
-            waste_actual_d_flat = self.waste_actual_d[n, :, :, self.t].flatten() 
-            inv_buy_flat = self.inv_buy[n, :, self.t].flatten()               
-            waste_inv_buy_flat = self.waste_inv_buy[n, :, self.t].flatten()   
-            state_flat = np.concatenate([state_flat, actual_d_flat, waste_actual_d_flat, inv_buy_flat, waste_inv_buy_flat])
-            
-            trans_states.append(state_flat)
-        return np.array(trans_states)
-
-    def step_sell(self, orig_leader_action):
-        """
-        Phase 1: Upper-Level Leader sets baseline pricing constraints (phi)
-        """
-        raw_phi = np.clip(orig_leader_action, 0.1, 10.0)
+        self.seller_obs_dim = self.num_commodities * self.history_length * (6 + self.num_agents * 8) + 2 * self.num_commodities 
+        self.buyer_obs_dim = self.seller_obs_dim + self.num_commodities + 2 * self.num_commodities * self.num_agents 
+        self.trans_obs_dim = self.buyer_obs_dim + self.num_commodities * (4 * self.num_agents + 3) 
         
-        alpha_smooth = 0.05
-        if self.active_phi is None:
-            self.active_phi = raw_phi
-        else:
-            self.active_phi = (1.0 - alpha_smooth) * self.active_phi + alpha_smooth * raw_phi
-        
-        for n in range(self.num_agents):
-            self.price[n, :, self.t] = self.active_phi[n] * self.spot_price[:, self.t]
-            self.waste_price[n, :, self.t] = 0.5 * self.price[n, :, self.t]
-            
-        return self.get_follower_state()
+        self.buyer_act_dim = 2 * self.num_commodities * (self.num_agents - 1) + self.num_commodities 
+        self.trans_act_dim = 2 * self.num_commodities 
+        self.leader_act_dim = 3  
+        self.leader_obs_dim = self.num_commodities + 2 
 
-    def get_seller_reward(self):
-        actual_d = self.actual_d[:, :, :, self.t].sum(axis=0)
-        waste_actual_d = self.waste_actual_d[:, :, :, self.t].sum(axis=0)
-
-        reward = (self.price[:, :, self.t] * actual_d).sum(axis=1)
-        reward += (self.waste_price[:, :, self.t] * waste_actual_d).sum(axis=1)
-        return reward * self.RWD_SCALE
-
-    def step_buy(self, orig_buyer_actions):
-        """
-        Phase 2: Followers execute buying actions under active market rules (phi)
-        """
-        keys = ['q', 'waste_q', 'spot_q']
-        nc = (self.num_agents - 1) * self.num_commodities
-        lengths = [nc, nc, self.num_commodities]
-        key_len_dict = {k: v for k, v in zip(keys, lengths)}
-        
-        buyer_actions = {k: np.zeros((self.num_agents, length)) for k, length in key_len_dict.items()}
-        for i in range(self.num_agents):
-            start = 0
-            for key, length in key_len_dict.items():
-                buyer_actions[key][i] = orig_buyer_actions[i, start:start + length]
-                start += length
-
-        for k, arr in buyer_actions.items():
-            if k == 'spot_q': continue
-            new_actions = np.zeros((self.num_agents, self.num_agents, self.num_commodities))
-            arr = arr.reshape(self.num_agents, self.num_agents - 1, self.num_commodities)
-            for i in range(self.num_agents):
-                i_list = list(range(self.num_agents))
-                i_list.remove(i)
-                new_actions[i, i_list] = arr[i]
-            buyer_actions[k] = new_actions
-
-        for key, value in buyer_actions.items():
-            getattr(self, key)[..., self.t] = value
-
-        actual_d = self.calc_actual_sold(self.q[:, :, :, self.t], self.inv[:, :, self.t])
-        actual_dw = self.calc_actual_sold(self.waste_q[:, :, :, self.t], self.waste_inv[:, :, self.t])
-        
-        inv_buy = self.inv[:, :, self.t] + np.sum(actual_d, axis=1) - np.sum(actual_d, axis=0)
-        waste_inv_buy = self.waste_inv[:, :, self.t] + np.sum(actual_dw, axis=1) - np.sum(actual_dw, axis=0)
-        inv_buy = inv_buy + self.spot_q[:, :, self.t]
-
-        self.actual_d[..., self.t] = actual_d
-        self.waste_actual_d[..., self.t] = actual_dw
-        self.inv_buy[..., self.t] = inv_buy
-        self.waste_inv_buy[..., self.t] = waste_inv_buy
-
-        buyer_rewards = []
-        for n in range(self.num_agents):
-            e_reshape = self.price[:, :, self.t]
-            ew_reshape = self.waste_price[:, :, self.t]
-            p_reshape = self.spot_price[:, self.t]
-            
-            reward = -np.sum(self.actual_d[n, :, :, self.t] * e_reshape)
-            reward -= np.sum(self.waste_actual_d[n, :, :, self.t] * ew_reshape)
-            reward -= np.sum(self.spot_q[n, :, self.t] * p_reshape)
-            
-            reward += self.active_phi[1] * np.sum(self.waste_actual_d[n, :, :, self.t])
-            reward -= self.active_phi[2] * np.sum(self.spot_q[n, :, self.t])
-            
-            buyer_rewards.append(reward * self.RWD_SCALE)
-
-        # Joint Feedback: Inject unpenalized selling revenue directly to encourage P2P circular trade
-        seller_rewards = self.get_seller_reward()
-        for n in range(self.num_agents):
-            buyer_rewards[n] += seller_rewards[n]
-
-        return np.array(buyer_rewards)
-
-    def step_trans(self, orig_trans_actions):
-        """
-        Phase 3: Followers execute manufacturing & transformation steps
-        """
-        keys = ['tx_u', 'eco_u']
-        key_len_dict = {k: self.num_commodities for k in keys}
-        
-        trans_actions = {k: np.zeros((self.num_agents, self.num_commodities)) for k in keys}
-        for i in range(self.num_agents):
-            start = 0
-            for key, length in key_len_dict.items():
-                trans_actions[key][i] = orig_trans_actions[i, start:start + length]
-                start += length
-
-        trans_actions['tx_u'] = np.minimum(trans_actions['tx_u'], 0.5 * self.inv_buy[..., self.t])
-        trans_actions['eco_u'] = np.minimum(trans_actions['eco_u'], 0.5 * self.inv_buy[..., self.t])
-
-        for key, value in trans_actions.items():
-            getattr(self, key)[..., self.t] = value
-
-        u_bot, w_bot = self.apply_agent_surrogate(trans_actions['tx_u'])
-        
-        self.inv[:, :, self.t + 1] = np.maximum(
-            self.inv_buy[:, :, self.t] - trans_actions['tx_u'] - trans_actions['eco_u'] + u_bot, 0.0
+        self.leader_agent = PPOAgent(
+            self.leader_obs_dim, self.leader_act_dim, f"{self.result_folder}/chpkt/leader", 
+            lr=self.lr_leader, min_val=0.1, max_val=10.0
         )
-        self.waste_inv[:, :, self.t + 1] = (1 - self.delta) * (self.waste_inv_buy[:, :, self.t] + w_bot)
-
-        uc_p = self.uc_p[:, self.t]
-        tx_p = self.tx_p[:, self.t]
-        trans_rewards = []
-        for n in range(self.num_agents):
-            r = np.sum(self.eco_u[n, :, self.t] * uc_p) - np.sum(self.tx_u[n, :, self.t] * tx_p)
-            if n == 2:  # Scale down Green H2 to prevent scale dominance
-                r = r * 0.01
-            trans_rewards.append(r * self.RWD_SCALE)
-
-        recycled_volume = np.sum(self.waste_actual_d[..., self.t])
-        landfilled_volume = np.sum(self.spot_q[..., self.t])
-        freshwater_consumption = np.sum(self.spot_q[:, 0, self.t])
         
-        # Upper-level societal target
-        leader_reward = recycled_volume - 1.0 * landfilled_volume - 0.1 * freshwater_consumption
-        leader_reward_scaled = leader_reward * self.RWD_SCALE
-
-        self.t += 1
-        done = (self.t == self.episode_length)
+        self.best_response_estimators = [
+            OptimalFollowerValueEstimator(self.leader_act_dim + self.buyer_obs_dim)
+            for _ in range(self.num_agents)
+        ]
         
-        return self.get_leader_state(), self.get_follower_state(), np.array(trans_rewards), leader_reward_scaled, done
+        self.buyer_agents = [
+            PPOAgent(
+                self.buyer_obs_dim, self.buyer_act_dim, f"{self.result_folder}/chpkt/buyer_{ag}", 
+                lr=self.lr_follower, min_val=0.01, max_val=100.0
+            ) for ag in range(self.num_agents)
+        ]
+        self.trans_agents = [
+            PPOAgent(
+                self.trans_obs_dim, self.trans_act_dim, f"{self.result_folder}/chpkt/trans_{ag}", 
+                lr=self.lr_follower, min_val=0.01, max_val=100.0
+            ) for ag in range(self.num_agents)
+        ]
 
-    def calc_actual_sold(self, q, I):
-        d = np.zeros_like(q)
-        for c in range(self.num_commodities):
-            for n in range(self.num_agents):
-                buys = np.array([q[m, n, c] for m in range(self.num_agents)])
-                sorted_indices = np.argsort(-buys)
-                cum_sum = 0
-                for i in range(self.num_agents):
-                    agent_i = sorted_indices[i]
-                    if i == 0:
-                        d[agent_i, n, c] = min(I[n, c], buys[agent_i])
-                    else:
-                        available_I = I[n, c] - cum_sum
-                        if available_I <= 0: break
-                        d[agent_i, n, c] = min(available_I, buys[agent_i])
-                    cum_sum += d[agent_i, n, c]
-        return d
+        self.leader_rms = RunningMeanStd(shape=(self.leader_obs_dim,))
+        self.buyer_rms = RunningMeanStd(shape=(self.num_agents, self.buyer_obs_dim))
+        self.trans_rms = RunningMeanStd(shape=(self.num_agents, self.trans_obs_dim))
 
-    def apply_agent_surrogate(self, tx_u):
-        agent0 = tx_u[0]
-        agent1 = tx_u[1]
-        agent2 = tx_u[2]
+    def rollout(self):
+        batch_obs = [[] for _ in stages]
+        batch_acts = [[] for _ in stages]
+        batch_log_probs = [[] for _ in stages]
+        batch_rews = [[] for _ in stages]
+        batch_active_phi = []  
+        batch_lens = []
 
-        agents_final_output_vec = np.zeros_like(tx_u)
-        agent0_surrogate_input_vec = np.array([agent0[5], agent0[7], agent0[2], agent0[0], agent0[1]])
-        agent0_surrogate_output_vec = self.surrogate_model.get_apap_model_outputs(agent0_surrogate_input_vec.reshape(1,-1))
-        agents_final_output_vec[0, [2, 6, 0]] = np.array(agent0_surrogate_output_vec)[0, [0, 1, 3]]
-        self.wastewater[:, :, self.t] = np.array(agent0_surrogate_output_vec)[0, [3]]
+        t = 0
+        while t < self.num_steps:
+            ep_rews = [[] for _ in stages]
+            s_leader, s_follower = self.env.reset()
+            done = False
+            
+            for ep_t in range(self.episode_length):
+                t += 1
+                batch_obs[LEADER].append(s_leader)
+                
+                self.leader_rms.update(s_leader)
+                s_leader_norm = self.leader_rms.normalize(s_leader)
+                
+                phi_bounded, raw_phi, log_p_leader = self.leader_agent.get_action(s_leader_norm)
+                batch_acts[LEADER].append(raw_phi)  
+                batch_log_probs[LEADER].append(log_p_leader)
+                
+                s_follower = self.env.step_sell(phi_bounded)  
+                batch_active_phi.append(self.env.active_phi)
+                s_buyer = self.env.get_buyer_state(s_follower)
 
-        agent1_surrogate_input_vec = np.array([agent1[3], agent1[4], agent1[10], agent1[9]])
-        agent1_surrogate_output_vec = self.surrogate_model.get_pap_model_outputs(agent1_surrogate_input_vec.reshape(1,-1))
-        agents_final_output_vec[1, [11, 5]] = np.array(agent1_surrogate_output_vec)[0, [0, 1]]
+                batch_obs[BUYER].append(s_buyer)
+                self.buyer_rms.update(s_buyer)
+                s_buyer_norm = self.buyer_rms.normalize(s_buyer)
+                
+                buyer_actions = []
+                buyer_raw_actions = []
+                log_p_buyers = []
+                for ag in range(self.num_agents):
+                    act_b_bounded, raw_b_act, log_p_b = self.buyer_agents[ag].get_action(s_buyer_norm[ag])
+                    buyer_actions.append(act_b_bounded)
+                    buyer_raw_actions.append(raw_b_act)
+                    log_p_buyers.append(log_p_b)
+                
+                buyer_actions = np.array(buyer_actions)
+                buyer_raw_actions = np.array(buyer_raw_actions)
+                batch_acts[BUYER].append(buyer_raw_actions)  
+                batch_log_probs[BUYER].append(log_p_buyers)
 
-        water_conv = agent2[0] if agent2[0] >= 19.*agent2[2] else 20.*agent2[0]/19.
-        agent2_surrogate_input_vec = np.array([water_conv])
-        agent2_surrogate_output_vec = self.surrogate_model.get_hyd_model_outputs(agent2_surrogate_input_vec.reshape(1,-1))
-        agents_final_output_vec[2, [2, 8, 3, 0]] = np.array(agent2_surrogate_output_vec)[0, [0, 1, 3, 4]]
+                rew_b = self.env.step_buy(buyer_actions)
+                s_trans = self.env.get_trans_state(s_buyer)
 
-        agents_waste_final_output_vec = np.zeros_like(tx_u)
-        agents_waste_final_output_vec[0, 0] = np.array(agent0_surrogate_output_vec)[0, 3] # Corrected
+                batch_obs[TRANSFORM].append(s_trans)
+                self.trans_rms.update(s_trans)
+                s_trans_norm = self.trans_rms.normalize(s_trans)
+                
+                trans_actions = []
+                trans_raw_actions = []
+                log_p_trans = []
+                for ag in range(self.num_agents):
+                    act_t_bounded, raw_t_act, log_p_t = self.trans_agents[ag].get_action(s_trans_norm[ag])
+                    trans_actions.append(act_t_bounded)
+                    trans_raw_actions.append(raw_t_act)
+                    log_p_trans.append(log_p_t)
+                
+                trans_actions = np.array(trans_actions)
+                trans_raw_actions = np.array(trans_raw_actions)
+                batch_acts[TRANSFORM].append(trans_raw_actions)
+                batch_log_probs[TRANSFORM].append(log_p_trans)
 
-        return agents_final_output_vec, agents_waste_final_output_vec
+                s_leader, s_follower, rew_t, rew_l, done = self.env.step_trans(trans_actions)
+                
+                ep_rews[LEADER].append(rew_l)
+                ep_rews[BUYER].append(rew_b)
+                ep_rews[TRANSFORM].append(rew_t)
+
+            batch_lens.append(ep_t + 1) 
+            for stage in stages:
+                batch_rews[stage].append(ep_rews[stage])
+
+        tensor_obs = [torch.tensor(np.array(obs), dtype=torch.float) for obs in batch_obs]
+        tensor_acts = [torch.tensor(np.array(act), dtype=torch.float) for act in batch_acts]
+        tensor_log_probs = [torch.tensor(np.array(lp), dtype=torch.float) for lp in batch_log_probs]
+
+        batch_rtgs, batch_rets = self.compute_rtgs(batch_obs, batch_rews, batch_lens)
+        return tensor_obs, tensor_acts, tensor_log_probs, batch_rtgs, batch_rets, batch_lens, batch_active_phi, batch_rews
+
+    def compute_rtgs(self, batch_obs, batch_rews, batch_lens):
+        batch_rtgs = [[] for _ in stages]
+        batch_rets = [[] for _ in stages]
+        for stage in stages:
+            ep_ret_list = []
+            flat_rtg_list = []
+            raw_obs = np.array(batch_obs[stage])
+            if stage == LEADER:
+                norm_obs = self.leader_rms.normalize(raw_obs)
+            elif stage == BUYER:
+                norm_obs = self.buyer_rms.normalize(raw_obs)
+            else:
+                norm_obs = self.trans_rms.normalize(raw_obs)
+                
+            obs_tensor = torch.tensor(norm_obs, dtype=torch.float32)
+            num_episodes = len(batch_rews[stage])
+            
+            with torch.no_grad():
+                if stage == LEADER:
+                    V = self.leader_agent.critic(obs_tensor).squeeze(-1)
+                elif stage == BUYER:
+                    V = torch.stack([self.buyer_agents[ag].critic(obs_tensor[:, ag, :]).squeeze(-1) for ag in range(self.num_agents)], dim=-1)
+                else:
+                    V = torch.stack([self.trans_agents[ag].critic(obs_tensor[:, ag, :]).squeeze(-1) for ag in range(self.num_agents)], dim=-1)
+            
+            V = V.cpu().numpy()
+            V_episodes = []
+            curr_idx = 0
+            for ep_len_val in batch_lens:
+                V_episodes.append(V[curr_idx:curr_idx + ep_len_val])
+                curr_idx += ep_len_val
+            
+            for ep in range(num_episodes):
+                rews = np.array(batch_rews[stage][ep])
+                vals = V_episodes[ep]
+                advantages = np.zeros_like(rews)
+                gae = np.zeros_like(rews[0])
+                for t in reversed(range(len(rews))):
+                    next_val = vals[t+1] if t + 1 < len(rews) else np.zeros_like(rews[0])
+                    delta = rews[t] + self.gamma * next_val - vals[t]
+                    gae = delta + self.gamma * 0.95 * gae
+                    advantages[t] = gae
+                rtg = advantages + vals
+                flat_rtg_list.extend(rtg)
+                ep_ret_list.append(rtg[0])
+                
+            batch_rtgs[stage] = torch.tensor(np.array(flat_rtg_list), dtype=torch.float)
+            batch_rets[stage] = np.mean(ep_ret_list, axis=0)
+        return batch_rtgs, batch_rets
+
+    def learn(self):
+        t_so_far = 0
+        i_so_far = 0
+
+        while i_so_far < self.num_epochs:
+            batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_rets, batch_lens, batch_active_phi, batch_rews = self.rollout()
+            t_so_far += 1000  
+            i_so_far += 1
+
+            ent_coef = max(0.005, 0.05 * (0.95 ** i_so_far))
+
+            raw_obs_buyer = batch_obs[BUYER].cpu().numpy()
+            self.buyer_rms.update(raw_obs_buyer)
+            norm_obs_buyer = torch.tensor(self.buyer_rms.normalize(raw_obs_buyer), dtype=torch.float32).to(batch_obs[BUYER].device)
+
+            raw_obs_trans = batch_obs[TRANSFORM].cpu().numpy()
+            self.trans_rms.update(raw_obs_trans)
+            norm_obs_trans = torch.tensor(self.trans_rms.normalize(raw_obs_trans), dtype=torch.float32).to(batch_obs[TRANSFORM].device)
+
+            for ag in range(self.num_agents):
+                a_loss_b, c_loss_b = self.buyer_agents[ag].learn(
+                    norm_obs_buyer[:, ag], batch_acts[BUYER][:, ag], 
+                    batch_log_probs[BUYER][:, ag], batch_rtgs[BUYER][:, ag], 10, entropy_coef=ent_coef
+                )
+                self.writer.add_scalar(f'buyer_actor_loss_agent_{ag}', a_loss_b, t_so_far)
+                self.writer.add_scalar(f'buyer_critic_loss_agent_{ag}', c_loss_b, t_so_far)
+
+                a_loss_t, c_loss_t = self.trans_agents[ag].learn(
+                    norm_obs_trans[:, ag], batch_acts[TRANSFORM][:, ag], 
+                    batch_log_probs[TRANSFORM][:, ag], batch_rtgs[TRANSFORM][:, ag], 10, entropy_coef=ent_coef
+                )
+                self.writer.add_scalar(f'trans_actor_loss_agent_{ag}', a_loss_t, t_so_far)
+                self.writer.add_scalar(f'trans_critic_loss_agent_{ag}', c_loss_t, t_so_far)
+
+            flat_active_phi = torch.tensor(np.array(batch_active_phi), dtype=torch.float32).reshape(-1, self.leader_act_dim).to(batch_obs[BUYER].device)
+            for ag in range(self.num_agents):
+                flat_state_norm = norm_obs_buyer[:, ag]
+                estimator_input = torch.cat([flat_active_phi, flat_state_norm], dim=-1)
+                target_returns = batch_rtgs[BUYER][:, ag]
+                loss_est = self.best_response_estimators[ag].update(estimator_input, target_returns)
+                self.writer.add_scalar(f'best_response_est_loss_agent_{ag}', loss_est, t_so_far)
+
+            if i_so_far % self.leader_update_frequency == 0:
+                penalties = []
+                for ag in range(self.num_agents):
+                    flat_state_norm = norm_obs_buyer[:, ag]
+                    estimator_input = torch.cat([flat_active_phi, flat_state_norm], dim=-1)
+                    v_star = self.best_response_estimators[ag](estimator_input).squeeze().detach()
+                    v_actual = batch_rtgs[BUYER][:, ag]
+                    penalties.append(v_star - v_actual)
+                
+                total_penalty = torch.stack(penalties, dim=0).mean(dim=0).unsqueeze(-1).detach()
+                clamped_penalty = torch.clamp(total_penalty, min=-10.0, max=10.0)
+                penalized_rtgs = batch_rtgs[LEADER] - self.lambda_penalty * clamped_penalty
+
+                raw_obs_leader = batch_obs[LEADER].cpu().numpy()
+                self.leader_rms.update(raw_obs_leader)
+                norm_obs_leader = torch.tensor(self.leader_rms.normalize(raw_obs_leader), dtype=torch.float32).to(batch_obs[LEADER].device)
+
+                a_loss_l, c_loss_l = self.leader_agent.learn(
+                    norm_obs_leader, batch_acts[LEADER], 
+                    batch_log_probs[LEADER], penalized_rtgs, 10, entropy_coef=ent_coef
+                )
+                self.writer.add_scalar('leader_actor_loss', a_loss_l, t_so_far)
+                self.writer.add_scalar('leader_critic_loss', c_loss_l, t_so_far)
+
+            self.writer.add_scalar('leader_avg_return', np.mean(batch_rets[LEADER]), t_so_far)
+            self.writer.add_scalar('buyer_avg_return', np.mean(batch_rets[BUYER]), t_so_far)
+            self.writer.add_scalar('trans_avg_return', np.mean(batch_rets[TRANSFORM]), t_so_far)
+            
+            print(f"Epoch {i_so_far}/{self.num_epochs} Done. Leader Return: {np.mean(batch_rets[LEADER]):.5f}")
+            raw_leader_return = np.mean([np.sum(ep) for ep in batch_rews[LEADER]])
+            
+            curr_epoch_results_dict = {
+                'actual_d': self.env.actual_d,
+                'waste_actual_d': self.env.waste_actual_d,
+                'spot_q': self.env.spot_q,
+                'inv': self.env.inv,
+                'waste_inv': self.env.waste_inv,
+                'raw_leader_return': raw_leader_return,
+                'buyer_avg_return': np.mean(batch_rets[BUYER]),
+                'trans_avg_return': np.mean(batch_rets[TRANSFORM])
+            }
+            np.save(f"{self.debug_folder}/epoch={i_so_far}_results.npy", curr_epoch_results_dict)
