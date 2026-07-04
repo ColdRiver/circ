@@ -19,7 +19,7 @@ logger_params = {
 def main():
     create_logger(**logger_params)
     print(f"System CPUs available: {multiprocessing.cpu_count()}")
-    print("Initializing Gaur et al. (2025) Bilevel Reinforcement Learning...")
+    print("Initializing Gaur et al. (2025) Bilevel Reinforcement Learning inside circ...")
     
     # Instantiate the hierarchical trainer
     trainer = BilevelTrainer()
