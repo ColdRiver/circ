@@ -10,7 +10,7 @@ from utils import AverageMeter, get_result_folder
 
 class RunningMeanStd:
     """
-    Tracks running mean and variance of observations dynamically normalizes into [-1.0, 1.0]
+    Dynamically normalizes observations into [ -1.0, 1.0 ]
     """
     def __init__(self, shape):
         self.mean = np.zeros(shape, dtype=np.float32)
@@ -51,7 +51,8 @@ class BilevelTrainer:
 
         self.env = Manufacturing_Simulator()
         
-        self.result_folder = './result/bilevel_ppo'
+        # --- PATH ISOLATION SPECIFIC FOR COLD-RIVER CIRC ---
+        self.result_folder = './result/bilevel_ppo_circ'
         self.debug_folder = self.result_folder + '/debug'
         log_folder = self.result_folder + '/log'
         
