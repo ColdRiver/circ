@@ -1,6 +1,6 @@
 import numpy as np
 
-## Settings for the stages (Leader acts first, then Followers sequence)
+# Settings for the stages (Leader acts first, then Followers sequence)
 LEADER = 0
 BUYER = 1
 TRANSFORM = 2
