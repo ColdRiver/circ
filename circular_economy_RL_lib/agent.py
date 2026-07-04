@@ -115,7 +115,7 @@ class PPOAgent:
         std = torch.clamp(torch.exp(self.log_std), min=1e-3, max=10.0)
         cov_mat = torch.diag(std ** 2)
         
-        dist = MultivariateNormal(mean, self.cov_mat)
+        dist = MultivariateNormal(mean, cov_mat) # Fixed: self.cov_mat replaced with local cov_mat
         log_probs = dist.log_prob(batch_acts)
         entropy = dist.entropy()
         return V, log_probs, entropy
@@ -131,7 +131,6 @@ class PPOAgent:
         else:
             A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10)
 
-        a_loss, c_loss = 0.0, 0.0
         for _ in range(n_itr):
             bs = batch_obs.shape[0]
             indices = torch.randperm(bs)
@@ -162,8 +161,3 @@ class PPOAgent:
             critic_loss.backward()
             nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             self.critic_optim.step()
-
-            a_loss += actor_loss.item()
-            c_loss += critic_loss.item()
-        
-        return a_loss / float(n_itr), c_loss / float(n_itr)
