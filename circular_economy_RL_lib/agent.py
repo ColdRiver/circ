@@ -89,7 +89,6 @@ class PPOAgent:
         self.actor_optim = optim.Adam(self.actor.parameters(), lr=lr)
         self.critic_optim = optim.Adam(self.critic.parameters(), lr=lr)
         
-        # Learnable standard deviation parameter allowing variance decay
         self.log_std = nn.Parameter(torch.zeros(n_actions) - 0.5)
         self.actor_optim.add_param_group({'params': self.log_std, 'lr': lr})
         
