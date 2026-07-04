@@ -224,7 +224,6 @@ class Manufacturing_Simulator:
             
             buyer_rewards.append(reward * self.RWD_SCALE)
 
-        # Joint Feedback: Inject unpenalized selling revenue directly to encourage P2P circular trade
         seller_rewards = self.get_seller_reward()
         for n in range(self.num_agents):
             buyer_rewards[n] += seller_rewards[n]
