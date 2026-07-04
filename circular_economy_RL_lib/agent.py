@@ -105,7 +105,6 @@ class PPOAgent:
         raw_action = dist.sample()
         log_prob = dist.log_prob(raw_action)
         
-        # Sigmoid bounding transformation mapping raw action to valid bounded physical range
         action = torch.sigmoid(raw_action) * (self.actor.max_val - self.actor.min_val) + self.actor.min_val
         
         return action.detach().numpy(), raw_action.detach().numpy(), log_prob.detach().numpy()
@@ -116,7 +115,7 @@ class PPOAgent:
         std = torch.clamp(torch.exp(self.log_std), min=1e-3, max=10.0)
         cov_mat = torch.diag(std ** 2)
         
-        dist = MultivariateNormal(mean, cov_mat)
+        dist = MultivariateNormal(mean, self.cov_mat)
         log_probs = dist.log_prob(batch_acts)
         entropy = dist.entropy()
         return V, log_probs, entropy
