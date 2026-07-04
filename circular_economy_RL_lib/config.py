@@ -25,9 +25,9 @@ config = {
     
     # BRL Parameters (Gaur et al. 2025)
     'lambda_penalty': 0.005,       # Calibrated penalty scale to prevent objective dominance
-    'lr_leader': 1e-4,             # Slower leader timescale
-    'lr_follower': 3e-4,           # Fast follower learning rate
-    'leader_update_frequency': 5,  # Alternating epoch timescale ratio
+    'lr_leader': 1e-4,             # Slower leader learning rate (outer timescale)
+    'lr_follower': 3e-4,           # Fast follower learning rate (inner timescale)
+    'leader_update_frequency': 5,  # Timescale update ratio
     
     # Training parameters
     'gamma': 0.99,
